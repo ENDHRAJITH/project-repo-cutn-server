@@ -1,4 +1,4 @@
-// server.js - FIXED TO MATCH DATABASE SCHEMA
+// server.js - Enhanced with GitHub link and My Students endpoint
 require('dotenv').config();
 const express = require('express');
 const mysql = require('mysql2/promise');
@@ -31,14 +31,14 @@ async function initDB() {
     // Seed departments
     await conn.query(`INSERT IGNORE INTO departments (department_id, name) VALUES (1, 'CSE'), (2, 'IT'), (3, 'ECE'), (4, 'Mech'), (5, 'Civil')`);
 
-    // Seed admin (username: admin@123 password: admin123)
+    // Seed admin
     const [admins] = await conn.query(`SELECT * FROM admins WHERE username = ?`, ['admin@123']);
     if (admins.length === 0) {
       await conn.query(`INSERT INTO admins (username, password) VALUES (?, ?)`, ['admin@123', 'admin123']);
       console.log('Seeded admin -> username: admin@123 / password: admin123');
     }
 
-    // Seed guide (Guide One / guidepass)
+    // Seed guide
     const [grows] = await conn.query(`SELECT * FROM guides WHERE guide_name = ?`, ['Guide One']);
     if (grows.length === 0) {
       await conn.query(`INSERT INTO guides (guide_name, department_id, designation, password) VALUES (?, ?, ?, ?)`,
@@ -46,30 +46,12 @@ async function initDB() {
       console.log('Seeded guide -> guide_name: Guide One / password: guidepass');
     }
 
-    // Seed student (roll: S1001 / studentpass)
+    // Seed student
     const [srows] = await conn.query(`SELECT * FROM students WHERE roll_number = ?`, ['S1001']);
     if (srows.length === 0) {
       await conn.query(`INSERT INTO students (roll_number, name, department_id, batch, password) VALUES (?, ?, ?, ?, ?)`,
         ['S1001', 'Student One', 1, '2023', 'studentpass']);
       console.log('Seeded student -> roll: S1001 / password: studentpass');
-    }
-
-    // Seed a sample project
-    const [guide] = await conn.query(`SELECT * FROM guides WHERE guide_name = ?`, ['Guide One']);
-    if (guide.length) {
-      const guideId = guide[0].guide_id;
-      const [projects] = await conn.query(`SELECT * FROM projects WHERE title = ?`, ['Sample Project']);
-      if (projects.length === 0) {
-        const [res] = await conn.query(`INSERT INTO projects (title, description, guide_id, department_id, member_type, project_type) VALUES (?, ?, ?, ?, ?, ?)`,
-          ['Sample Project', 'A sample seeded project', guideId, 1, 'individual', 'semester']);
-        const projectId = res.insertId;
-
-        const [student] = await conn.query(`SELECT * FROM students WHERE roll_number = ?`, ['S1001']);
-        if (student.length) {
-          await conn.query(`INSERT IGNORE INTO project_students (project_id, student_id) VALUES (?, ?)`, [projectId, student[0].student_id]);
-          console.log('Seeded Sample Project and mapped Student One to it.');
-        }
-      }
     }
 
     console.log('DB initialized');
@@ -196,15 +178,39 @@ app.get('/students/me/project', authMiddleware(['student']), async (req, res) =>
 //
 app.post('/guides/projects', authMiddleware(['guide']), async (req, res) => {
   const guideId = req.user.id;
-  const { title, description, department_id, member_type = 'individual', project_type = 'semester' } = req.body;
+  const { title, description, department_id, member_type = 'individual', project_type = 'semester', github_link } = req.body;
   if (!title) return res.status(400).json({ message: 'title required' });
   
   try {
     const conn = await pool.getConnection();
-    const [r] = await conn.query(`INSERT INTO projects (title, description, guide_id, department_id, member_type, project_type) VALUES (?, ?, ?, ?, ?, ?)`,
-      [title, description, guideId, department_id, member_type, project_type]);
+    const [r] = await conn.query(`INSERT INTO projects (title, description, guide_id, department_id, member_type, project_type, github_link) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [title, description, guideId, department_id, member_type, project_type, github_link || null]);
     conn.release();
     return res.json({ message: 'Project created', project_id: r.insertId });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.put('/guides/projects/:projectId', authMiddleware(['guide']), async (req, res) => {
+  const guideId = req.user.id;
+  const projectId = req.params.projectId;
+  const { title, description, github_link } = req.body;
+
+  try {
+    const conn = await pool.getConnection();
+    const [proj] = await conn.query(`SELECT * FROM projects WHERE project_id = ? AND guide_id = ?`, [projectId, guideId]);
+    if (!proj.length) {
+      conn.release();
+      return res.status(403).json({ message: 'Project not found or not owned by you' });
+    }
+
+    await conn.query(`UPDATE projects SET title = ?, description = ?, github_link = ? WHERE project_id = ?`,
+      [title || proj[0].title, description || proj[0].description, github_link || proj[0].github_link, projectId]);
+    
+    conn.release();
+    return res.json({ message: 'Project updated successfully' });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: 'Server error' });
@@ -318,6 +324,27 @@ app.get('/guides/me/projects', authMiddleware(['guide']), async (req, res) => {
   }
 });
 
+// NEW: Get all students under a guide
+app.get('/guides/me/students', authMiddleware(['guide']), async (req, res) => {
+  try {
+    const guideId = req.user.id;
+    const conn = await pool.getConnection();
+    
+    // Use the view we created
+    const [students] = await conn.query(`
+      SELECT * FROM vw_guide_students 
+      WHERE guide_id = ? 
+      ORDER BY student_name
+    `, [guideId]);
+
+    conn.release();
+    return res.json({ students });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Server error' });
+  }
+});
+
 //
 // ADMIN routes
 //
@@ -330,7 +357,7 @@ app.get('/admin/dashboard', authMiddleware(['admin']), async (req, res) => {
     const [[{ total_projects }]] = await conn.query(`SELECT COUNT(*) AS total_projects FROM projects`);
 
     const [finalProjects] = await conn.query(`
-      SELECT p.project_id, p.title, p.project_type, g.guide_name, d.name as department_name
+      SELECT p.project_id, p.title, p.project_type, p.github_link, g.guide_name, d.name as department_name
       FROM projects p 
       LEFT JOIN guides g ON p.guide_id = g.guide_id
       LEFT JOIN departments d ON d.department_id = p.department_id
@@ -374,6 +401,24 @@ app.get('/admin/students', authMiddleware(['admin']), async (req, res) => {
   }
 });
 
+app.post('/admin/students', authMiddleware(['admin']), async (req, res) => {
+  const { roll_number, name, department_id, batch, password } = req.body;
+  if (!roll_number || !name || !password) {
+    return res.status(400).json({ message: 'roll_number, name, and password are required' });
+  }
+
+  try {
+    const conn = await pool.getConnection();
+    await conn.query(`INSERT INTO students (roll_number, name, department_id, batch, password) VALUES (?, ?, ?, ?, ?)`,
+      [roll_number, name, department_id || null, batch || null, password]);
+    conn.release();
+    return res.json({ message: 'Student created successfully' });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
 app.get('/admin/guides', authMiddleware(['admin']), async (req, res) => {
   try {
     const conn = await pool.getConnection();
@@ -387,6 +432,24 @@ app.get('/admin/guides', authMiddleware(['admin']), async (req, res) => {
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.post('/admin/guides', authMiddleware(['admin']), async (req, res) => {
+  const { guide_name, department_id, designation, password } = req.body;
+  if (!guide_name || !password) {
+    return res.status(400).json({ message: 'guide_name and password are required' });
+  }
+
+  try {
+    const conn = await pool.getConnection();
+    await conn.query(`INSERT INTO guides (guide_name, department_id, designation, password) VALUES (?, ?, ?, ?)`,
+      [guide_name, department_id || null, designation || null, password]);
+    conn.release();
+    return res.json({ message: 'Guide created successfully' });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
 
@@ -426,6 +489,23 @@ app.get('/admin/departments', authMiddleware(['admin']), async (req, res) => {
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.post('/admin/departments', authMiddleware(['admin']), async (req, res) => {
+  const { name } = req.body;
+  if (!name) {
+    return res.status(400).json({ message: 'name is required' });
+  }
+
+  try {
+    const conn = await pool.getConnection();
+    await conn.query(`INSERT INTO departments (name) VALUES (?)`, [name]);
+    conn.release();
+    return res.json({ message: 'Department created successfully' });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
 
